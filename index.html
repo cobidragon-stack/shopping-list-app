@@ -233,8 +233,15 @@
     </div>
   </main>
 
-  <script>
-    const STORAGE_KEY = "shopping-list-items";
+  <script type="module">
+    import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+    const SUPABASE_URL = "https://zirjcppgmnwuquowwqqs.supabase.co";
+    const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_0l1LCPAHBn1Tr3EEnAaJ9w_WHP1n0ly";
+    const TABLE = "shopping_items";
+    const LEGACY_STORAGE_KEY = "shopping-list-items";
+
+    const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
 
     const listEl = document.getElementById("list");
     const emptyEl = document.getElementById("empty");
@@ -242,22 +249,64 @@
     const inputEl = document.getElementById("input");
     const countEl = document.getElementById("count");
     const clearDoneEl = document.getElementById("clear-done");
+    const submitBtn = formEl.querySelector("button[type='submit']");
 
-    let items = loadItems();
+    let items = [];
 
-    function loadItems() {
-      try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (!raw) return [];
-        const parsed = JSON.parse(raw);
-        return Array.isArray(parsed) ? parsed : [];
-      } catch {
-        return [];
-      }
+    function newId() {
+      return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     }
 
-    function saveItems() {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+    async function migrateLocalStorage() {
+      let raw;
+      try {
+        raw = localStorage.getItem(LEGACY_STORAGE_KEY);
+      } catch {
+        return;
+      }
+      if (!raw) return;
+
+      let legacy;
+      try {
+        legacy = JSON.parse(raw);
+      } catch {
+        legacy = null;
+      }
+      if (!Array.isArray(legacy) || legacy.length === 0) {
+        localStorage.removeItem(LEGACY_STORAGE_KEY);
+        return;
+      }
+
+      const rows = legacy
+        .filter((i) => i && typeof i.text === "string")
+        .map((i) => ({
+          id: typeof i.id === "string" && i.id ? i.id : newId(),
+          text: i.text,
+          done: !!i.done,
+        }));
+
+      if (rows.length > 0) {
+        const { error } = await supabase
+          .from(TABLE)
+          .upsert(rows, { onConflict: "id" });
+        if (error) {
+          console.error("로컬 데이터 마이그레이션 실패:", error);
+          return;
+        }
+      }
+      localStorage.removeItem(LEGACY_STORAGE_KEY);
+    }
+
+    async function fetchItems() {
+      const { data, error } = await supabase
+        .from(TABLE)
+        .select("id, text, done, created_at")
+        .order("created_at", { ascending: false });
+      if (error) {
+        console.error("아이템을 불러오지 못했습니다:", error);
+        return [];
+      }
+      return data ?? [];
     }
 
     function render() {
@@ -311,50 +360,84 @@
       }
     }
 
-    function addItem(text) {
+    async function addItem(text) {
       const trimmed = text.trim();
       if (!trimmed) return;
-      items.unshift({
-        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-        text: trimmed,
-        done: false,
-      });
-      saveItems();
+      const row = { id: newId(), text: trimmed, done: false };
+      items.unshift(row);
       render();
+      const { error } = await supabase.from(TABLE).insert(row);
+      if (error) {
+        console.error("추가 실패:", error);
+        items = items.filter((i) => i.id !== row.id);
+        render();
+      }
     }
 
-    function toggleItem(id) {
+    async function toggleItem(id) {
       const item = items.find((i) => i.id === id);
       if (!item) return;
-      item.done = !item.done;
-      saveItems();
+      const next = !item.done;
+      item.done = next;
       render();
+      const { error } = await supabase
+        .from(TABLE)
+        .update({ done: next })
+        .eq("id", id);
+      if (error) {
+        console.error("업데이트 실패:", error);
+        item.done = !next;
+        render();
+      }
     }
 
-    function deleteItem(id) {
+    async function deleteItem(id) {
+      const prev = items;
       items = items.filter((i) => i.id !== id);
-      saveItems();
       render();
+      const { error } = await supabase.from(TABLE).delete().eq("id", id);
+      if (error) {
+        console.error("삭제 실패:", error);
+        items = prev;
+        render();
+      }
     }
 
-    function clearDone() {
-      const remaining = items.filter((i) => !i.done);
-      if (remaining.length === items.length) return;
-      items = remaining;
-      saveItems();
+    async function clearDone() {
+      const doneIds = items.filter((i) => i.done).map((i) => i.id);
+      if (doneIds.length === 0) return;
+      const prev = items;
+      items = items.filter((i) => !i.done);
       render();
+      const { error } = await supabase
+        .from(TABLE)
+        .delete()
+        .in("id", doneIds);
+      if (error) {
+        console.error("일괄 삭제 실패:", error);
+        items = prev;
+        render();
+      }
     }
 
-    formEl.addEventListener("submit", (e) => {
+    formEl.addEventListener("submit", async (e) => {
       e.preventDefault();
-      addItem(inputEl.value);
+      const value = inputEl.value;
       inputEl.value = "";
       inputEl.focus();
+      await addItem(value);
     });
 
     clearDoneEl.addEventListener("click", clearDone);
 
-    render();
+    (async function init() {
+      submitBtn.disabled = true;
+      countEl.textContent = "불러오는 중...";
+      await migrateLocalStorage();
+      items = await fetchItems();
+      submitBtn.disabled = false;
+      render();
+    })();
   </script>
 </body>
 </html>
